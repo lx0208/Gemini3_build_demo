@@ -1,40 +1,72 @@
-# Gemini3_build_demo
-Gemini 3 vibe code
-sequenceDiagram
-    autonumber
-    participant VM as OCI VM (Python App)
-    participant KC as Keycloak (OIDC Provider)
-    participant STS as GCP STS (sts.googleapis.com)
-    participant DISC as Keycloak OIDC Discovery/JWKS
-    participant IAMC as IAMCredentials (generateAccessToken)
-    participant VAI as Vertex AI API (aiplatform.googleapis.com)
+事前にローカル環境では、WIF（Workload Identity Federation）による認証が問題なく動作することを確認しました。
 
-    Note over VM: 0) 预置：Keycloak client(Confidential + Service accounts)\n已配置 aud（Audience mapper）\nGCP 已配置 WIF Pool/Provider + SA 绑定权限
+しかし、実際にOCI VM上でプロジェクトを実行したところ、
+社内Proxyの制限により、以下の認証用APIへの通信がブロックされていることが判明しました。
 
-    VM->>KC: 1) POST /realms/<realm>/protocol/openid-connect/token\n grant_type=client_credentials\n client_id + client_secret
-    KC-->>VM: 2) access_token (JWT)\n iss=<realm issuer>\n sub=<client/service-account subject>\n aud=<你配置的aud>\n exp=...
+・sts.googleapis.com  
+・iamcredentials.googleapis.com  
 
-    Note over VM: 3) VM 把 JWT 作为 subject_token\n（写文件或直接内存传给 google-auth external_account）
+このため、WIFでのトークン交換（access token取得）が失敗し、
+Vertex AI（Gemini）APIを呼び出す前の段階で処理が停止してしまいます。
 
-    VM->>STS: 4) Token Exchange (RFC8693)\n subject_token=JWT\n subject_token_type=jwt\n audience=//iam.googleapis.com/.../workloadIdentityPools/.../providers/...
-    Note over STS: 5) STS 需要验证 JWT 签名与声明
+ご提案いただいたPSC（Private Service Connect）について調査した結果、
+現在のPSC設定は Vertex AI（aiplatform）API専用であり、
+認証処理に必要な STS / IAM API には対応していないことが分かりました。
 
-    STS->>DISC: 6) GET /.well-known/openid-configuration
-    DISC-->>STS: 7) 返回 jwks_uri / issuer 等信息
-    STS->>DISC: 8) GET <jwks_uri> 拉取公钥集合(JWKS)
-    DISC-->>STS: 9) 返回公钥(KID->Key)
+そのため、PSC経由のみではWIF認証は成立せず、
+本件は解決できない状況です。
 
-    Note over STS: 10) 校验：iss/aud/exp/签名(KID)\n通过后生成 federated token
-    STS-->>VM: 11) 返回 federated access token（短期）
+対応策としては、以下のいずれかが必要と考えております。
 
-    alt 使用 Service Account Impersonation（推荐）
-        VM->>IAMC: 12) generateAccessToken\n Authorization: Bearer <federated token>\n 目标：serviceAccount:<SA_EMAIL>
-        IAMC-->>VM: 13) 返回 SA access token（更标准/权限明确）
-        VM->>VAI: 14) 调用 Vertex AI\n Authorization: Bearer <SA access token>
-        VAI-->>VM: 15) 响应
-    else 不做 Impersonation（不常用）
-        VM->>VAI: 14') 直接用 federated token 调用（取决于配置）
-        VAI-->>VM: 15') 响应
-    end
+・Proxyのホワイトリストに  
+　sts.googleapis.com  
+　iamcredentials.googleapis.com  
+　を追加する  
+または  
+・認証用APIも含めたPSC／通信許可の設計を行う
 
-    Note over VM: 16) Token 过期前刷新：\n重新向 Keycloak 取 JWT → STS exchange → (可选) impersonate → 调用 API
+現状の構成を最小限変更する方法としては、
+STS / IAM API のホワイトリスト追加が最も現実的だと考えております。
+
+ご確認・ご検討のほど、よろしくお願いいたします。
+
+
+----
+
+
+補足として、PSC（Private Service Connect）利用時の認証方式について説明いたします。
+
+現在ご提供いただいているPSC構成では、
+以下の認証方式のみが前提となっていると理解しております。
+
+・ADC（Application Default Credentials）による
+　GCP VPC内からの認証
+・Service Account Key（鍵ファイル）を用いた認証
+
+しかし、本案件の構成ではOCI VM上で実行しており、
+GCP VPC内のADCは利用できないため、
+外部環境向けの認証方式としてWIF（Workload Identity Federation）を採用しております。
+
+また、Service Account Key認証については、
+セキュリティポリシー上、原則として使用しない方針となっております。
+
+理由としては以下の通りです。
+
+・長期間有効な秘密鍵ファイルの管理リスクが高い  
+・鍵漏洩時の影響範囲が大きい  
+・クラウドベンダー（Google）公式としても非推奨である  
+
+そのため、
+「ADC（GCP内）または Service Account Key 前提」
+というPSC設計では、
+OCIなどの外部環境＋WIF構成では成立しない状況となります。
+
+外部環境から安全にVertex AIを利用するためには、
+WIF認証に必要な以下のAPI通信が必須となります。
+
+・sts.googleapis.com  
+・iamcredentials.googleapis.com  
+
+これらをProxyのホワイトリストに追加していただくことで、
+Service Account Keyを使用せず、
+セキュリティを担保した形での連携が可能となります。
